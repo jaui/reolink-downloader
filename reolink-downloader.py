@@ -376,12 +376,14 @@ async def main_async(args: argparse.Namespace) -> None:
             await list_camera(cam, username, password, start, end, stream)
         return
 
-    total_downloaded = 0
-    for cam in cameras:
-        if _shutdown:
-            break
-        count = await download_camera(cam, username, password, start, end, output_dir, stream, args.force)
-        total_downloaded += count
+    # Kameras parallel herunterladen
+    async def dl_cam(cam):
+        return await download_camera(
+            cam, username, password, start, end, output_dir, stream, args.force,
+        )
+
+    results = await asyncio.gather(*[dl_cam(cam) for cam in cameras])
+    total_downloaded = sum(results)
 
     if _shutdown:
         print(f"\nAbgebrochen. {total_downloaded} Datei(en) heruntergeladen nach: {output_dir}")

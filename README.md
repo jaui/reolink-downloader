@@ -145,3 +145,68 @@ downloads/
 - `reolink-aio` — Async Reolink API Client
 - `keyring` — Sichere Passwortspeicherung (Windows Credential Manager)
 - `aiohttp` — HTTP-Client für Downloads
+
+---
+
+# Timelapse Generator (`timelapse.py`)
+
+Erstellt ein Timelapse-Video aus Reolink motion-triggered Aufnahmen.
+Extrahiert die ersten N Frames aus jedem Video und wählt daraus eine
+gleichmäßig über den Tag verteilte Auswahl aus.
+
+## Voraussetzungen
+
+FFmpeg muss unter `c:\localapps\ffmpeg\bin\` installiert sein (keine pip-Abhängigkeiten).
+
+## Ablauf
+
+```
+1. Alle Videos eines Zeitraums einlesen (sortiert nach Zeitstempel im Dateinamen)
+2. Aus jedem Video die ersten N Frames extrahieren (mit absolutem Zeitstempel)
+3. Über den gesamten Zeitraum gleichmäßig verteilte Ziel-Zeitpunkte berechnen
+4. Pro Ziel-Zeitpunkt den nächstgelegenen verfügbaren Frame wählen
+5. Frames per ffmpeg zu einem einzelnen Timelapse-Video zusammensetzen
+```
+
+## Kommandozeilen-Optionen
+
+```
+  --input-dir PATH       Eingabeverzeichnis (kann cam1/, cam1/cam1_IP/ oder c:\video.in\ sein)
+  --output-dir PATH      Ausgabeverzeichnis (Standard: c:\video.out\timelapse)
+  --date YYYY-MM-DD      Einzelnes Datum (oder "all")
+  --from YYYY-MM-DD      Startdatum (zusammen mit --to)
+  --to   YYYY-MM-DD      Enddatum   (zusammen mit --from)
+  --frames-per-video N   Frames vom Anfang jedes Videos (Standard: 1)
+  --duration SEC         Gewünschte Ausgabelänge in Sekunden (Standard: 10s pro Tag)
+  --total-frames N       Feste Frameanzahl (überschreibt --duration)
+  --day-start HH:MM      Beginn des Tagesfensters (Standard: 16:00)
+  --day-end   HH:MM      Ende des Tagesfensters   (Standard: 21:00)
+  --fps N                Framerate des Ausgabevideos (Standard: 10)
+  --width / --height     Auflösung skalieren (Standard: original)
+```
+
+## Ausgabe-Dateiname
+
+```
+timelapse_{cam}_{datum}.mp4              # einzelner Tag
+timelapse_{cam}_{startdatum}_{enddatum}.mp4   # Zeitraum
+```
+
+Der Kamera-Name (`cam1`, `cam2`, …) wird automatisch aus dem Pfad extrahiert.
+
+## Beispiele
+
+```bash
+# Alle Tage, automatische Dauer (10s/Tag), Standardfenster 16-21 Uhr
+python timelapse.py --input-dir c:\video.in --from 2026-02-12 --to 2026-02-28
+
+# Mehr Kandidaten durch breiteres Zeitfenster und mehr Frames pro Video
+python timelapse.py --input-dir c:\video.in --from 2026-02-12 --to 2026-02-28 \
+    --day-start "" --day-end "" --frames-per-video 3
+
+# Feste Ausgabelänge 60 Sekunden
+python timelapse.py --input-dir c:\video.in --date all --duration 60
+
+# Nur ein Tag, halbe Auflösung
+python timelapse.py --input-dir c:\video.in --date 2026-02-15 --width 960 --height 540
+```
