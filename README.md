@@ -158,6 +158,9 @@ gleichmäßig über den Tag verteilte Auswahl aus.
 
 FFmpeg muss unter `c:\localapps\ffmpeg\bin\` installiert sein (keine pip-Abhängigkeiten).
 
+Download: [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip)
+→ Inhalt nach `c:\localapps\ffmpeg\` entpacken (sodass `c:\localapps\ffmpeg\bin\ffmpeg.exe` existiert).
+
 ## Ablauf
 
 ```
