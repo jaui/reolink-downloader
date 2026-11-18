@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ereignis-Viewer</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<header class="top">
+  <div class="bar">
+    <a class="brand" href="#">Ereignisse</a>
+    <nav id="crumbs" class="crumbs"></nav>
+    <span class="spacer"></span>
+    <span id="status" class="status"></span>
+    <button id="btn-refresh" class="icon-btn" title="Aktualisieren" aria-label="Aktualisieren">⟳</button>
+    <button id="btn-filter" class="icon-btn only-mobile" aria-expanded="false" aria-controls="filters" title="Filter">☰</button>
+  </div>
+  <form id="filters" class="filters" autocomplete="off" onsubmit="return false">
+    <div class="seg" role="group" aria-label="Kamera" id="f-cam"></div>
+    <div class="chips" role="group" aria-label="Typ">
+      <label class="chip person"><input type="checkbox" id="f-person"> Personen</label>
+      <label class="chip vehicle"><input type="checkbox" id="f-vehicle"> Fahrzeuge</label>
+    </div>
+    <div class="seg" role="group" aria-label="Tageszeit" id="f-light">
+      <button type="button" data-v="all">Tag &amp; Nacht</button>
+      <button type="button" data-v="day">Tag</button>
+      <button type="button" data-v="night">Nacht</button>
+    </div>
+    <label class="toggle"><input type="checkbox" id="f-near"> Fahrzeuge nur nah &amp; bewegt</label>
+    <div class="range">
+      <input type="date" id="f-from" aria-label="von">
+      <span>–</span>
+      <input type="date" id="f-to" aria-label="bis">
+    </div>
+    <input type="search" id="f-q" placeholder="Kennzeichen / Fahrzeug" aria-label="Kennzeichen oder Fahrzeug suchen">
+  </form>
+</header>
+
+<main id="main"></main>
+
+<aside id="detail" class="detail" hidden aria-label="Ereignisdetail"></aside>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

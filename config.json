@@ -9,6 +9,16 @@
             "name": "cam2",
             "host": "192.168.1.41",
             "channel": 0
+        },
+        {
+            "name": "garage2",
+            "host": "192.168.1.42",
+            "channel": 0
+        },
+        {
+            "name": "schuppen2",
+            "host": "192.168.1.43",
+            "channel": 0
         }
     ],
     "username": "reolink",

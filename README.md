@@ -213,3 +213,105 @@ python timelapse.py --input-dir c:\video.in --date all --duration 60
 # Nur ein Tag, halbe Auflösung
 python timelapse.py --input-dir c:\video.in --date 2026-02-15 --width 960 --height 540
 ```
+
+---
+
+# Erkennungs-Pipeline (Personen, Fahrzeuge, Kennzeichen)
+
+Zweistufig, damit nicht alle 12-MP-Clips geladen werden müssen:
+
+1. **Sub-Stream laden** (klein, ~1/5 der Größe) und **Personen/Fahrzeuge erkennen** (`detect.py`).
+2. Nur Clips mit **nahen, fahrenden Fahrzeugen** im **Main-Stream** nachladen und **Kennzeichen lesen** (`plates_scan.py`).
+3. Ergebnisse im **Ereignis-Viewer** ansehen (`viewer.py`, siehe unten).
+
+## Werkzeuge
+
+Erkennung und Kennzeichen laufen in einem eigenen venv unter `c:\localapps\alpr` (nur CPU):
+
+```bash
+python -m venv c:\localapps\alpr\venv
+c:\localapps\alpr\venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu
+c:\localapps\alpr\venv\Scripts\pip install ultralytics "fast-alpr[onnx]" opencv-python-headless truststore lap
+```
+
+Modelle liegen in `c:\localapps\alpr\models` (`yolo11n.pt`, fast-alpr-Modelle werden beim ersten Lauf dorthin geladen). ffmpeg wie beim Timelapse unter `c:\localapps\ffmpeg\bin`.
+
+## Ablauf
+
+```bash
+# 1. Sub-Stream laden (je Kamera nur ein Download gleichzeitig; Kameras parallel möglich)
+python fetch_clips.py --camera garage2 --stream sub --from 2026-10-22 --to 2026-11-18
+
+# 2. Stufe 1: Personen + Fahrzeuge (dauerhaft, alle 10 min neue Clips)
+c:\localapps\alpr\venv\Scripts\python detect.py --camera garage2 --classes all --watch 600
+c:\localapps\alpr\venv\Scripts\python detect.py --camera schuppen2 --classes person
+
+# 3. Main-Stream nur für Clips mit nahen, fahrenden Fahrzeugen nachladen
+python fetch_clips.py --camera garage2 --stream main --from 2026-10-22 --to 2026-11-18 ^
+    --from-events downloads\detections\garage2\events.jsonl
+
+# 4. Stufe 2: Kennzeichen lesen
+c:\localapps\alpr\venv\Scripts\python plates_scan.py --camera garage2
+
+# Kameraeinstellungen (Bild/Nacht/IR) auslesen
+python camsettings.py --camera garage2
+```
+
+| Skript | wichtige Optionen |
+|---|---|
+| `fetch_clips.py` | `--camera`, `--stream main\|sub`, `--from`, `--to`, `--only <liste.txt>`, `--from-events <events.jsonl>`, `--min-area` (0.02), `--min-path` (0.05) |
+| `detect.py` | `--camera` oder Ordner/Dateien + `--out`, `--classes person\|vehicle\|all`, `--fps` (2), `--from`, `--to`, `--watch SEK` |
+| `plates_scan.py` | `--camera` oder Ordner/Dateien + `--out`, `--from`, `--to`, `--fps` (2), `--min-plate-area` (0.008), `--keep-area` (0.02) |
+
+Alle Schritte sind fortsetzbar (`done.txt` bzw. vorhandene Dateien werden übersprungen).
+
+**Nachts** überstrahlt die IR-Beleuchtung die reflektierenden Kennzeichen; Lesungen gelingen praktisch nur bei Tageslicht oder im Farbmodus.
+
+---
+
+# Ereignis-Viewer (`viewer.py`)
+
+Kleine Web-App (Flask) zum Durchsehen der erkannten **Personen** und **Fahrzeuge** inkl. Kennzeichen-Lesungen. Läuft lokal; Bilder und Videos verlassen den Rechner nicht.
+
+- Filter: Kamera, Personen/Fahrzeuge, Tag/Nacht, Zeitraum, „Fahrzeuge nur nah & bewegt" (blendet geparkte Autos und entfernten Verkehr aus), Suche nach Kennzeichen oder Fahrzeugname
+- Drilldown: Tagesübersicht (mit 24-h-Streifen) → Ereignisse eines Tages (Karten) → Detail mit Video, Bildausschnitten, Kennzeichen
+- Responsiv (Handy: Detail als Vollbild), Zustand im URL-Hash (Zurück-Taste, Lesezeichen), Aktualisierung alle 60 s
+
+## Installation & Start
+
+```bash
+venv\Scripts\activate
+pip install -r requirements-viewer.txt
+python viewer.py                      # http://127.0.0.1:8765/
+python viewer.py --host 0.0.0.0       # im LAN erreichbar (z. B. Handy), Zugriff nur mit ausgegebenem Token-Link
+```
+
+| Option | Bedeutung |
+|---|---|
+| `--port` | Port (Standard 8765) |
+| `--host` | Adresse (Standard 127.0.0.1; bei anderer Adresse wird ein Zufallstoken erzeugt) |
+| `--det-dir` | Ordner mit den Erkennungsdaten (Standard `<output_dir>/detections`) |
+| `--plates-camera` | Kamera, zu der `plates/tracks.jsonl` gehört (Standard `garage2`) |
+
+## Watchlist
+
+`watchlist.json` neben dem Skript (nicht im Git, Vorlage `watchlist.json.example`):
+
+```json
+{ "AB CD 123": "Beispielauto blau" }
+```
+
+Treffer werden grün markiert: `exakt`, `teil` (Teil hinter dem Ortskürzel), `fuzzy` (1 Zeichen Abweichung) oder `neben` (Nebenlesung).
+
+## Erwartete Daten
+
+```
+downloads/detections/
+├── <kamera>/events.jsonl     # eine Zeile je Track: cls, video ("<datum>/<datei>.mp4"), t_first, t_last,
+│                             # best_t, max_area, path, max_conf, ir, box, crop
+├── <kamera>/crops/*.jpg
+└── plates/tracks.jsonl       # Kennzeichen-Lesungen (Main-Stream): video, reads[{t,text,conf,png}], veh_jpg, color
+    plates/veh/*.jpg, plates/plates/*.png
+```
+
+Videos werden aus der Download-Ablage abgespielt, bevorzugt der Sub-Stream (`<name>_sub_<host>`, H.264). Main-Stream-Clips (H.265, 12 MP) kann der Browser meist nicht abspielen; dann wird ein Download-Link angezeigt.
