@@ -9,13 +9,19 @@ Erwartete Daten unter --det-dir (Standard: <output_dir>/detections):
     plates/tracks.jsonl        Kennzeichen-Lesungen aus dem Main-Stream (optional)
     plates/veh/*.jpg, plates/plates/*.png
 Videos kommen aus der Download-Ablage: <output_dir>/<name>_sub_<host>/<datum>/<datei>.mp4
+
+Nachklassifikation: Korrekturen aus der Oberfläche (Klasse, Fehlalarm, Fahrzeug, Kennzeichen)
+und Fehlalarm-Regeln für stehende Objekte landen in <det-dir>/labels.db (SQLite). Die
+Erkennungsdateien bleiben unverändert; die Korrekturen werden beim Ausliefern darübergelegt.
 """
 
 import argparse
+import gzip
 import json
 import re
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 from collections import defaultdict
@@ -35,6 +41,14 @@ VEHICLE_CLASSES = {"car", "bus", "truck"}
 MOVING_MIN_PATH = 0.05      # normierte Verschiebung des Box-Mittelpunkts
 NEAR_MIN_AREA = 0.02        # Box-Anteil am Bild für "nahe" Fahrzeuge
 MATCH_TOLERANCE_S = 10      # Main- und Sub-Dateinamen weichen ca. 2 s ab
+RULE_IOU = 0.5              # Fehlalarm-Regel: Mindestüberlappung der Box mit der Regel-Box
+
+# Klassen für die Nachklassifikation -> Art (person/vehicle/other/fp)
+REVIEW_CLASSES = {
+    "person": "person", "bicycle": "person",
+    "car": "vehicle", "truck": "vehicle", "bus": "vehicle", "motorcycle": "vehicle",
+    "animal": "other", "fp": "fp",
+}
 
 app = Flask(__name__)
 CFG: dict = {}              # wird in main() gesetzt
@@ -165,14 +179,21 @@ def plate_summary(reads: list[dict], watchlist: list[dict]) -> dict | None:
     }
 
 
-def track_entry(camera: str, tr: dict) -> dict:
+def track_key(prefix: str, tr: dict) -> str:
+    """Stabiler Schlüssel je Track (für Korrekturen): <kamera|plates>/<clip>/<klasse>/<track-id>."""
+    return f"{prefix}/{Path(tr.get('video', '')).stem}/{tr.get('cls', '?')}/{tr.get('track', 0)}"
+
+
+def track_entry(camera: str, tr: dict, key: str) -> dict:
     cls = tr.get("cls", "?")
     kind = "person" if cls == "person" else "vehicle" if cls in VEHICLE_CLASSES else "other"
     area = tr.get("max_area", 0)
     path = tr.get("path", 0)
     return {
+        "key": key,
         "kind": kind,
         "cls": cls,
+        "orig_cls": cls,
         "t_first": tr.get("t_first", 0),
         "t_last": tr.get("t_last", tr.get("t_first", 0)),
         "best_t": tr.get("best_t", tr.get("t_first", 0)),
@@ -211,7 +232,7 @@ def build_events() -> dict:
                     "video": video_url(camera, start.strftime("%Y-%m-%d"), name),
                     "tracks": [],
                 }
-            ev["tracks"].append(track_entry(camera, tr))
+            ev["tracks"].append(track_entry(camera, tr, track_key(camera, tr)))
 
     # Kennzeichen (Main-Stream) zuordnen; ohne passenden Sub-Clip eigenes Ereignis
     plates_cam = CFG["plates_camera"]
@@ -225,7 +246,7 @@ def build_events() -> dict:
         plate = plate_summary(tr.get("reads", []), watchlist)
         candidates = [e for e in by_cam_time[plates_cam]
                       if abs((e["clip_start"] - start).total_seconds()) <= MATCH_TOLERANCE_S]
-        entry = track_entry(plates_cam, tr)
+        entry = track_entry(plates_cam, tr, track_key("plates", tr))
         entry["crop"] = f"/plates/veh/{tr['veh_jpg']}" if tr.get("veh_jpg") else None
         entry["color"] = tr.get("color")
         entry["plate"] = plate
@@ -281,11 +302,123 @@ def build_events() -> dict:
         "generated": datetime.now().isoformat(timespec="seconds"),
         "cameras": sorted({e["camera"] for e in out}),
         "watchlist": [{"plate": w["plate"], "label": w["label"]} for w in watchlist],
+        "rule_iou": RULE_IOU,
         "events": out,
     }
 
 
-_cache = {"key": None, "data": None}
+# ---------------------------------------------------------------------------
+# Nachklassifikation (SQLite)
+# ---------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS labels (
+    key      TEXT PRIMARY KEY,      -- track_key()
+    camera   TEXT NOT NULL,
+    video    TEXT NOT NULL,         -- Clip-Datei, zur Orientierung
+    orig_cls TEXT,                  -- Klasse laut Erkennung
+    cls      TEXT,                  -- korrigierte Klasse (REVIEW_CLASSES) oder NULL = bestätigt/unverändert
+    vehicle  TEXT,                  -- zugeordnetes Watchlist-Kennzeichen
+    plate    TEXT,                  -- korrigiertes Kennzeichen (normiert)
+    note     TEXT,
+    updated  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rules (  -- Fehlalarm-Regel für stehende Objekte an einer Stelle
+    id       INTEGER PRIMARY KEY,
+    camera   TEXT NOT NULL,
+    cls      TEXT NOT NULL,         -- erkannte Klasse, für die die Regel gilt
+    x0 REAL NOT NULL, y0 REAL NOT NULL, x1 REAL NOT NULL, y1 REAL NOT NULL,
+    source   TEXT,                  -- Track, aus dem die Regel entstand
+    created  TEXT NOT NULL
+);
+"""
+
+_labels_version = 0                 # wird bei jedem Schreiben erhöht -> Cache neu
+
+
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(CFG["db_path"], timeout=10)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db() -> None:
+    with db() as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.executescript(SCHEMA)
+
+
+def load_labels() -> tuple[dict, list]:
+    with db() as con:
+        labels = {r["key"]: dict(r) for r in con.execute("SELECT * FROM labels")}
+        rules = [dict(r) for r in con.execute("SELECT * FROM rules ORDER BY id")]
+    return labels, rules
+
+
+def iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def rule_hit(camera: str, t: dict, rules: list) -> dict | None:
+    if t["moving"] or not t.get("box"):
+        return None
+    for r in rules:
+        if r["camera"] == camera and r["cls"] == t["orig_cls"] \
+                and iou(t["box"], (r["x0"], r["y0"], r["x1"], r["y1"])) >= RULE_IOU:
+            return r
+    return None
+
+
+def labeled_track(camera: str, t: dict, labels: dict, rules: list, watchlist: list) -> dict | None:
+    """Korrektur bzw. Regel auf einen Track anwenden; None = unverändert."""
+    lab = labels.get(t["key"])
+    rule = None if lab and lab["cls"] else rule_hit(camera, t, rules)
+    if not lab and not rule:
+        return None
+    t = dict(t)
+    if rule:
+        t.update(cls="fp", kind="fp")
+        t["review"] = {"by": "rule", "rule": rule["id"]}
+    if lab:
+        if lab["cls"]:
+            t["cls"] = lab["cls"]
+            t["kind"] = REVIEW_CLASSES.get(lab["cls"], "other")
+            t["near"] = t["kind"] == "person" or t["area"] >= NEAR_MIN_AREA
+        t["review"] = {"by": "manual", "cls": lab["cls"], "vehicle": lab["vehicle"],
+                       "plate": lab["plate"], "note": lab["note"], "updated": lab["updated"],
+                       **({"rule": rule["id"]} if rule else {})}
+        base = t["plate"] or {"text": "", "conf": None, "n_reads": 0, "n_total": 0,
+                              "alternatives": [], "match": None, "img": None}
+        plate = None
+        if lab["plate"]:
+            plate = dict(base, text=lab["plate"], match=match_watchlist(lab["plate"], watchlist), manual=True)
+        if lab["vehicle"]:
+            w = next((w for w in watchlist if w["plate"] == lab["vehicle"]), None)
+            if w:
+                plate = dict(plate or base, match={"plate": w["plate"], "label": w["label"], "type": "manuell"},
+                             manual=True)
+                plate["text"] = plate["text"] or w["norm"]
+        if plate:
+            t["plate"] = plate
+    return t
+
+
+def apply_labels(base: dict, labels: dict, rules: list) -> dict:
+    watchlist = load_watchlist()
+    events = []
+    for ev in base["events"]:
+        new = [labeled_track(ev["camera"], t, labels, rules, watchlist) for t in ev["tracks"]]
+        if any(new):
+            ev = dict(ev, tracks=[n or t for n, t in zip(new, ev["tracks"])])
+        events.append(ev)
+    return dict(base, events=events, rules=[{**r, "box": [r["x0"], r["y0"], r["x1"], r["y1"]]} for r in rules])
+
+
+_cache = {"key": None, "base": None, "lv": None, "data": None, "index": {}}
 _cache_lock = threading.Lock()
 
 
@@ -299,12 +432,27 @@ def cache_key() -> tuple:
 
 
 def get_events() -> dict:
+    """Erkennungsdaten (Cache nach mtime) + darübergelegte Korrekturen (Cache nach Version)."""
     with _cache_lock:
         key = cache_key()
         if key != _cache["key"]:
-            _cache["data"] = build_events()
+            _cache["base"] = build_events()
             _cache["key"] = key
+            _cache["lv"] = None
+            _cache["index"] = {t["key"]: (ev["camera"], ev["id"], t)
+                               for ev in _cache["base"]["events"] for t in ev["tracks"]}
+        if _cache["lv"] != _labels_version:
+            _cache["data"] = apply_labels(_cache["base"], *load_labels())
+            _cache["lv"] = _labels_version
         return _cache["data"]
+
+
+def find_track(key: str) -> tuple[str, str, dict]:
+    get_events()
+    hit = _cache["index"].get(key)
+    if hit is None:
+        abort(404)
+    return hit
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +474,13 @@ def set_token_cookie(resp):
     token = CFG.get("token")
     if token and request.args.get("token") == token:
         resp.set_cookie("viewer_token", token, httponly=True, samesite="Strict", max_age=30 * 86400)
+    # JSON komprimieren (Ereignisliste ~2 MB -> ~0,2 MB, wichtig fürs Handy im LAN)
+    if resp.mimetype == "application/json" and not resp.direct_passthrough \
+            and "gzip" in request.headers.get("Accept-Encoding", "") \
+            and (resp.content_length or 0) > 2048 and "Content-Encoding" not in resp.headers:
+        resp.set_data(gzip.compress(resp.get_data(), 5))
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Vary"] = "Accept-Encoding"
     return resp
 
 
@@ -341,6 +496,148 @@ def index():
 @app.get("/api/events")
 def api_events():
     resp = jsonify(get_events())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def json_body() -> dict:
+    # nur application/json: verhindert, dass fremde Seiten per einfachem Formular-POST schreiben
+    if not request.is_json:
+        abort(415)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        abort(400)
+    return body
+
+
+def changed_events(ids: set[str]) -> dict:
+    global _labels_version
+    _labels_version += 1
+    data = get_events()
+    return {"events": [e for e in data["events"] if e["id"] in ids], "rules": data["rules"]}
+
+
+def events_with_rule(rule_id: int) -> set[str]:
+    return {ev["id"] for ev in get_events()["events"]
+            for t in ev["tracks"] if (t.get("review") or {}).get("rule") == rule_id}
+
+
+@app.post("/api/label")
+def api_label():
+    """Korrektur eines Tracks: {key, cls?, vehicle?, plate?, note?} oder {key, reset: true}."""
+    body = json_body()
+    camera, event_id, t = find_track(str(body.get("key", "")))
+    if body.get("reset"):
+        with db() as con:
+            con.execute("DELETE FROM labels WHERE key = ?", (t["key"],))
+        return jsonify(changed_events({event_id}))
+    cls = body.get("cls") or None
+    if cls is not None and cls not in REVIEW_CLASSES:
+        abort(400)
+    vehicle = body.get("vehicle") or None
+    if vehicle is not None and vehicle not in {w["plate"] for w in load_watchlist()}:
+        abort(400)
+    plate = norm_plate(str(body.get("plate") or ""))[:12] or None
+    note = str(body.get("note") or "")[:500] or None
+    with db() as con:
+        con.execute(
+            """INSERT INTO labels (key, camera, video, orig_cls, cls, vehicle, plate, note, updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET cls=excluded.cls, vehicle=excluded.vehicle,
+                   plate=excluded.plate, note=excluded.note, updated=excluded.updated""",
+            (t["key"], camera, event_id.split("/", 1)[1], t["orig_cls"], cls, vehicle, plate, note,
+             datetime.now().isoformat(timespec="seconds")))
+    return jsonify(changed_events({event_id}))
+
+
+@app.post("/api/rule")
+def api_rule_add():
+    """Fehlalarm-Regel aus einem stehenden Track: gilt für alle stehenden Tracks gleicher
+    Klasse an derselben Stelle (Box-Überlappung >= RULE_IOU) dieser Kamera."""
+    body = json_body()
+    camera, event_id, t = find_track(str(body.get("key", "")))
+    if t["moving"] or not t.get("box"):
+        abort(400)
+    x0, y0, x1, y1 = t["box"]
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO rules (camera, cls, x0, y0, x1, y1, source, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (camera, t["orig_cls"], x0, y0, x1, y1, t["key"], datetime.now().isoformat(timespec="seconds")))
+        rule_id = cur.lastrowid
+    global _labels_version
+    _labels_version += 1
+    return jsonify(changed_events(events_with_rule(rule_id) | {event_id}))
+
+
+@app.delete("/api/rule/<int:rule_id>")
+def api_rule_delete(rule_id):
+    ids = events_with_rule(rule_id)
+    with db() as con:
+        con.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+    return jsonify(changed_events(ids))
+
+
+STALE_S = 90   # ohne Lebenszeichen länger als das gilt ein laufender Download als "steht"
+
+
+def detected_per_day(path: Path, by_name: bool) -> dict[str, int]:
+    """done.txt -> Anzahl erledigter Clips je Datum (Stufe 1: 'datum/datei', Stufe 2: 'datei')."""
+    out: dict[str, int] = defaultdict(int)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").split():
+            m = FILENAME_RE.search(line)
+            if m:
+                out[m.group(1)] += 1
+    return dict(out)
+
+
+def build_status() -> dict:
+    status_dir: Path = CFG["output_dir"] / "status"
+    det_dir: Path = CFG["det_dir"]
+    now = datetime.now()
+    jobs = []
+    for f in sorted(status_dir.glob("*.json")) if status_dir.is_dir() else []:
+        try:
+            job = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        updated = datetime.fromisoformat(job.get("updated", job.get("started")))
+        age = (now - updated).total_seconds()
+        state = job.get("state", "?")
+        if state in ("plan", "läuft") and age > STALE_S:
+            state = "steht"
+        days = job.get("days", {})
+        tot = {k: sum(d.get(k, 0) for d in days.values()) for k in ("clips", "bytes", "done", "done_bytes")}
+        if job.get("stream") == "sub":
+            det = detected_per_day(det_dir / job["camera"] / "done.txt", False)
+        else:
+            det = detected_per_day(det_dir / "plates" / "done.txt", True) \
+                if job["camera"] == CFG["plates_camera"] else {}
+        for d, v in days.items():
+            v["detected"] = min(det.get(d, 0), v.get("done", 0))
+        rate = job.get("rate_bps", 0) if state == "läuft" else 0
+        cur = job.get("current")
+        remaining = tot["bytes"] - tot["done_bytes"] - (cur or {}).get("received", 0)
+        jobs.append({
+            **job, "days": days, "state": state, "age": round(age), "totals": tot,
+            "detected": sum(v["detected"] for v in days.values()),
+            "eta_s": round(remaining / rate) if rate > 0 and remaining > 0 else None,
+        })
+    detectors = {}
+    for cam_dir in sorted(p for p in det_dir.iterdir() if p.is_dir()):
+        log = cam_dir / "detect.log"
+        if log.exists():
+            age = now.timestamp() - log.stat().st_mtime
+            with open(log, "rb") as fh:
+                fh.seek(max(log.stat().st_size - 400, 0))
+                last = fh.read().decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+            detectors[cam_dir.name] = {"age": round(age), "last": last[0]}
+    return {"generated": now.isoformat(timespec="seconds"), "jobs": jobs, "detectors": detectors}
+
+
+@app.get("/api/status")
+def api_status():
+    resp = jsonify(build_status())
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -402,13 +699,15 @@ def main():
         print(f"Fehler: Erkennungsordner {det_dir} nicht gefunden.", file=sys.stderr)
         sys.exit(1)
 
-    CFG.update(config=config, output_dir=output_dir, det_dir=det_dir, plates_camera=args.plates_camera)
+    CFG.update(config=config, output_dir=output_dir, det_dir=det_dir, plates_camera=args.plates_camera,
+               db_path=det_dir / "labels.db")
     local = args.host in ("127.0.0.1", "localhost", "::1")
     if not local:
         CFG["token"] = secrets.token_urlsafe(16)
 
+    init_db()
     data = get_events()
-    print(f"Erkennungsdaten: {det_dir}")
+    print(f"Erkennungsdaten: {det_dir} (Korrekturen: {CFG['db_path'].name})")
     print(f"{len(data['events'])} Ereignisse von {', '.join(data['cameras']) or '-'}"
           f"{'' if WATCHLIST_FILE.exists() else ' (keine watchlist.json)'}")
     if local:

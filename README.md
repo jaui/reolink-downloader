@@ -274,8 +274,13 @@ Alle Schritte sind fortsetzbar (`done.txt` bzw. vorhandene Dateien werden übers
 Kleine Web-App (Flask) zum Durchsehen der erkannten **Personen** und **Fahrzeuge** inkl. Kennzeichen-Lesungen. Läuft lokal; Bilder und Videos verlassen den Rechner nicht.
 
 - Filter: Kamera, Personen/Fahrzeuge, Tag/Nacht, Zeitraum, „Fahrzeuge nur nah & bewegt" (blendet geparkte Autos und entfernten Verkehr aus), Suche nach Kennzeichen oder Fahrzeugname
-- Drilldown: Tagesübersicht (mit 24-h-Streifen) → Ereignisse eines Tages (Karten) → Detail mit Video, Bildausschnitten, Kennzeichen
+- Drilldown: Jahre → Monate → Tage → Stunden → Detail mit Video, Bildausschnitten, Kennzeichen; Start ist der aktuelle Tag. Jede Zeile hat einen Zeitstreifen (Monate/Tage/Stunden), ein Klick auf ein Fach springt direkt dorthin
+- Personenzahl auf den Karten: `2` = zwei Spuren, gleichzeitig im Bild; `1–3` = höchstens eine gleichzeitig, aber drei Spuren (eine Person bekommt nach Verdeckung oft eine neue Spur)
+- Nachklassifikation im Detail: Klasse korrigieren (Person, Fahrrad, Auto, LKW/Transporter, Bus, Motorrad, Tier, Fehlalarm), bestätigen, Fahrzeug aus der Watchlist zuordnen oder Kennzeichen von Hand eintragen (danach per Suche auffindbar). Tasten: `B` bestätigen, `F` Fehlalarm, `P` Person, `A` Auto, `L` LKW, `T` Tier. Für stehende Fehlalarme (z. B. Gartenstuhl als „Person“) gibt es eine Regel „alle stehenden Erkennungen dieser Klasse an dieser Stelle“. Filter „Prüfung“: Alle / Offen / Geprüft / Fehlalarme
+- Korrekturen liegen in `downloads/detections/labels.db` (SQLite); die Erkennungsdateien bleiben unverändert
 - Responsiv (Handy: Detail als Vollbild), Zustand im URL-Hash (Zurück-Taste, Lesezeichen), Aktualisierung alle 60 s
+- Download-Fortschritt: Karte je laufendem `fetch_clips.py` (geladen/erkannt, MB/s, Restzeit, aktueller Clip, Erkennung aktiv?) und je Tag in der Tagesübersicht; Tage ohne Ereignisse erscheinen ebenfalls (Zeitverlauf lückenlos)
+- Darstellung: System / Hell (Sonne) / Dunkel (Mond), wird im Browser gemerkt
 
 ## Installation & Start
 

@@ -50,11 +50,14 @@ Running the downloader requires reachable cameras listed in `config.json` and a 
 - Reads detection output from `<output_dir>/detections/<camera>/events.jsonl` + `plates/tracks.jsonl`, rebuilt on mtime change; one event per clip, filtering is client-side.
 - Plate tracks (main stream) are matched to sub-stream clips by time (±10 s, filenames differ by ~2 s); unmatched ones become their own events.
 - Videos served via `send_from_directory` (Range/206 + traversal protection); camera folders derived from `config.json`.
+- Manual corrections (class, false positive, vehicle, plate) and static false-positive rules live in `<det-dir>/labels.db` (SQLite, stdlib); they are overlaid on the JSONL data in `apply_labels` (keyed by `track_key` = `<camera|plates>/<clip>/<cls>/<track>`). Detection outputs stay append-only JSONL. Writes are JSON-only POSTs (blocks form CSRF); `/api/events` is gzip-compressed.
+- UI drilldown position is the hash key `at` (`all` | `YYYY` | `YYYY-MM` | `YYYY-MM-DD` | `YYYY-MM-DDTHH`; empty = today).
 - `watchlist.json` (gitignored) maps plates to labels. Non-localhost `--host` enables a random access token.
 
 ### Detection pipeline
 - Folder layout: sub stream in `<output_dir>/<name>_sub_<host>/`, main in `<name>_<host>/` (same as the downloader); results in `<output_dir>/detections/<camera>/` (stage 1) and `detections/plates/` (stage 2). All resumable via `done.txt`.
 - Cameras serve only **one download at a time** (HTTP 503 otherwise) at ~0.8 MB/s; different cameras can run in parallel. `fetch_clips.py` writes `.part` files and skips clips still being recorded.
+- `fetch_clips.py` lists all days first, then downloads; progress goes to `<output_dir>/status/<camera>_<stream>.json` (atomic replace, heartbeat every ~2 s). `viewer.py` `/api/status` adds per-day detection counts from `done.txt` and marks jobs "steht" when the heartbeat is older than 90 s.
 - Main and sub filenames for the same clip differ by ~2 s → always match by time with ±10 s tolerance.
 - `detect.py --watch SEK` keeps processing newly downloaded clips. Pass folders, not globbed file lists (Windows command-line limit).
 - Night: IR overexposes plates, so plate reads are mostly daylight/colour-mode only.
