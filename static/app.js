@@ -1,7 +1,7 @@
 "use strict";
 
 // ---------- Zustand (im URL-Hash) ----------
-const DEFAULTS = { cam: "all", p: "1", v: "1", near: "1", light: "all", rv: "", q: "", from: "", to: "", at: "", ev: "" };
+const DEFAULTS = { cam: "all", p: "1", b: "1", v: "1", near: "1", light: "all", rv: "", q: "", from: "", to: "", at: "", ev: "" };
 const S = { ...DEFAULTS };
 let DATA = null;
 let STATUS = null;
@@ -12,9 +12,9 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const CLS = { person: "Person", bicycle: "Fahrrad", car: "Auto", truck: "LKW/Transporter", bus: "Bus",
   motorcycle: "Motorrad", animal: "Tier", fp: "Fehlalarm" };
-const ICON = { person: "🚶", vehicle: "🚗", other: "🐾", fp: "⊘" };
+const ICON = { person: "🚶", bike: "🚲", vehicle: "🚗", other: "🐾", fp: "⊘" };
 // Nachklassifikation: Klassen mit Tastenkürzel (im Detail)
-const REVIEW = [["person", "p"], ["bicycle", ""], ["car", "a"], ["truck", "l"], ["bus", ""], ["motorcycle", ""],
+const REVIEW = [["person", "p"], ["bicycle", "r"], ["car", "a"], ["truck", "l"], ["bus", ""], ["motorcycle", ""],
   ["animal", "t"], ["fp", "f"]];
 
 function readHash() {
@@ -35,10 +35,13 @@ function writeHash(push) {
 const normPlate = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 function trackOk(t) {
-  if (S.rv === "fp") return t.kind === "fp" || t.kind === "other";
+  if (S.rv === "fp") return t.kind === "fp" || t.kind === "other" || !!t.weak;
+  if (t.weak && !t.plate) return false;    // unsicher (schwach oder Prüfstufe nicht bestätigt)
   if (S.rv === "open" && t.review) return false;
   if (S.rv === "done" && t.review?.by !== "manual") return false;
   if (t.kind === "person") return S.p === "1";
+  // abgestellte Räder stehen dauernd im Bild -> wie Fahrzeuge nur bewegte zeigen
+  if (t.kind === "bike") return S.b === "1" && (S.near !== "1" || t.moving);
   if (t.kind === "vehicle") return S.v === "1" && (S.near !== "1" || (t.near && t.moving) || !!t.plate);
   return false;
 }
@@ -79,13 +82,14 @@ function view(e) {
   const persons = tracks.filter((t) => t.kind === "person");
   const np = persons.length;
   const ppl = maxSimultaneous(persons);   // mindestens so viele Personen (gleichzeitig im Bild)
+  const nb = tracks.filter((t) => t.kind === "bike").length;
   const nv = tracks.filter((t) => t.kind === "vehicle").length;
-  const nx = tracks.length - np - nv;
+  const nx = tracks.length - np - nb - nv;
   const plates = tracks.filter((t) => t.plate);
   const hits = plates.filter((t) => t.plate.match);
   const lead = hits[0] || plates[0]
     || [...tracks].sort((a, b) => (b.kind === "vehicle") - (a.kind === "vehicle") || b.area - a.area)[0];
-  return { e, tracks, np, ppl, nv, nx, plates, hits, lead, thumb: lead.plate_crop || lead.crop };
+  return { e, tracks, np, ppl, nb, nv, nx, plates, hits, lead, thumb: lead.plate_crop || lead.crop };
 }
 
 function filtered() {
@@ -145,20 +149,21 @@ function neighbors(cur, keys) {
 
 // ---------- Zeitstreifen (Stunden / Tage / Monate) ----------
 function bins(views, n, binOf) {
-  const p = new Array(n).fill(0), v = new Array(n).fill(0), x = new Array(n).fill(0);
+  const p = new Array(n).fill(0), r = new Array(n).fill(0), v = new Array(n).fill(0), x = new Array(n).fill(0);
   for (const w of views) {
     const b = binOf(w);
     if (b < 0 || b >= n) continue;
     if (w.np) p[b]++;
+    if (w.nb) r[b]++;
     if (w.nv) v[b]++;
     if (w.nx) x[b]++;
   }
-  return { p, v, x };
+  return { p, r, v, x };
 }
 
 function binMax(groups, n, binOf) {
   let m = 1;
-  for (const vs of groups.values()) { const b = bins(vs, n, binOf); m = Math.max(m, ...b.p, ...b.v, ...b.x); }
+  for (const vs of groups.values()) { const b = bins(vs, n, binOf); m = Math.max(m, ...b.p, ...b.r, ...b.v, ...b.x); }
   return m;
 }
 
@@ -172,6 +177,7 @@ function strip(views, n, binOf, max, o) {
   if (S.rv === "fp") rows.push(row(b.x, "x", "mit Fehlalarmen"));
   else {
     if (S.p === "1") rows.push(row(b.p, "p", "mit Personen"));
+    if (S.b === "1" && b.r.some(Boolean)) rows.push(row(b.r, "r", "mit Fahr-/Motorrädern"));
     if (S.v === "1") rows.push(row(b.v, "v", "mit Fahrzeugen"));
   }
   const axis = `<div class="strip-axis" style="--n:${n}">${[...Array(n).keys()].map((i) => `<span${o.show(i) ? ' class="on"' : ""}>${o.label(i)}</span>`).join("")}</div>`;
@@ -182,8 +188,9 @@ const hourStrip = (d) => ({ label: (h) => h, show: (h) => h % 6 === 0, title: (h
 
 function countsHtml(vs) {
   if (S.rv === "fp") return `<span class="cnt other" title="Ereignisse mit Fehlalarmen/Sonstigem">${ICON.fp} ${nf(vs.length)}</span>`;
-  const np = vs.filter((x) => x.np).length, nv = vs.filter((x) => x.nv).length;
+  const np = vs.filter((x) => x.np).length, nb = vs.filter((x) => x.nb).length, nv = vs.filter((x) => x.nv).length;
   return (S.p === "1" ? `<span class="cnt person" title="Ereignisse mit Personen">${ICON.person} ${nf(np)}</span>` : "")
+    + (S.b === "1" && nb ? `<span class="cnt bike" title="Ereignisse mit Fahr-/Motorrädern">${ICON.bike} ${nf(nb)}</span>` : "")
     + (S.v === "1" ? `<span class="cnt vehicle" title="Ereignisse mit Fahrzeugen">${ICON.vehicle} ${nf(nv)}</span>` : "");
 }
 
@@ -401,6 +408,7 @@ function cardHtml(x, prevView) {
     && (Date.parse(e.start) - Date.parse(prevView.e.start)) / 1000 <= prevView.e.duration + 60;
   const counts = [
     x.np ? `<span class="cnt person" title="${esc(pplTitle(x))}">${ICON.person}${x.np > 1 ? " " + pplText(x) : ""}</span>` : "",
+    x.nb ? `<span class="cnt bike">${ICON.bike}${x.nb > 1 ? " " + x.nb : ""}</span>` : "",
     x.nv ? `<span class="cnt vehicle">${ICON.vehicle}${x.nv > 1 ? " " + x.nv : ""}</span>` : "",
     x.nx ? `<span class="cnt other">${ICON.fp}${x.nx > 1 ? " " + x.nx : ""}</span>` : "",
     x.tracks.some((t) => t.review?.by === "manual") ? `<span class="badge rv" title="von Hand geprüft">✓</span>` : "",
@@ -567,7 +575,7 @@ function renderDetailTracks(e) {
     <button type="button" class="track${ok.has(t.key) ? "" : " dim"}${t.key === selKey ? " sel" : ""}${t.kind === "fp" ? " fp" : ""}" data-ti="${i}" aria-pressed="${t.key === selKey}">
       ${t.crop ? `<img loading="lazy" src="${esc(t.plate_crop || t.crop)}" alt="">` : "<span></span>"}
       <span>
-        <span class="t-title">${ICON[t.kind] || ""} ${esc(CLS[t.cls] || t.cls)} ${t.color ? `<span class="t-meta">${esc(t.color)}</span>` : ""} ${plateBadge(t, true)}${t.review?.by === "manual" ? ` <span class="badge rv">✓</span>` : ""}</span>
+        <span class="t-title">${ICON[t.kind] || ""} ${esc(CLS[t.cls] || t.cls)} ${t.color ? `<span class="t-meta">${esc(t.color)}</span>` : ""} ${plateBadge(t, true)}${t.review?.by === "manual" ? ` <span class="badge rv">✓</span>` : ""}${t.weak ? ` <span class="badge weak" title="${esc(t.weak)}">unsicher</span>` : ""}${t.verify?.ok ? ` <span class="badge rv" title="von ${esc(t.verify.model)} bestätigt (Konf. ${t.verify.conf})">geprüft</span>` : ""}</span>
         <span class="t-meta">${t.t_first.toFixed(1)}–${t.t_last.toFixed(1)} s · Größe ${(t.area * 100).toFixed(1)} % · Bewegung ${t.path.toFixed(2)}${t.conf != null ? " · Konf. " + t.conf : ""}${t.night ? " · IR" : ""}${esc(reviewText(t))}${ok.has(t.key) ? "" : " · ausgefiltert"}</span>
       </span>
     </button>`).join("");
@@ -699,6 +707,7 @@ function syncFilterUI() {
   for (const b of $("#f-light").children) b.setAttribute("aria-pressed", b.dataset.v === S.light);
   for (const b of $("#f-rv").children) b.setAttribute("aria-pressed", b.dataset.v === S.rv);
   $("#f-person").checked = S.p === "1";
+  $("#f-bike").checked = S.b === "1";
   $("#f-vehicle").checked = S.v === "1";
   $("#f-near").checked = S.near === "1";
   $("#f-from").value = S.from;
@@ -722,6 +731,7 @@ function bindUI() {
     S.rv = b.dataset.v; writeHash(false);
   });
   $("#f-person").addEventListener("change", (ev) => { S.p = ev.target.checked ? "1" : "0"; writeHash(false); });
+  $("#f-bike").addEventListener("change", (ev) => { S.b = ev.target.checked ? "1" : "0"; writeHash(false); });
   $("#f-vehicle").addEventListener("change", (ev) => { S.v = ev.target.checked ? "1" : "0"; writeHash(false); });
   $("#f-near").addEventListener("change", (ev) => { S.near = ev.target.checked ? "1" : "0"; writeHash(false); });
   $("#f-from").addEventListener("change", (ev) => { S.from = ev.target.value; writeHash(false); });

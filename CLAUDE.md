@@ -8,7 +8,7 @@ Standalone Windows CLI scripts (no package, no tests, no linter configured):
 
 - `reolink-downloader.py` — lists/downloads recordings from Reolink cameras via the local API (`reolink-aio`).
 - `timelapse.py` — builds a timelapse MP4 from the downloaded motion-triggered clips using an external ffmpeg binary. Standard library only.
-- Detection pipeline: `fetch_clips.py` (per-camera/stream range download) → `detect.py` (stage 1, persons/vehicles on sub-stream) → `fetch_clips.py --stream main --from-events` → `plates_scan.py` (stage 2, plates on main stream) → `viewer.py` (Flask web UI). `camsettings.py` dumps camera image/night settings (read-only).
+- Detection pipeline: `fetch_clips.py` (per-camera/stream range download) → `detect.py` (stage 1, persons/bikes/vehicles on sub-stream) → `fetch_clips.py --stream main --from-events` → `plates_scan.py` (stage 2, plates on main stream) → `viewer.py` (Flask web UI). `camsettings.py` dumps camera image/night settings (read-only).
 
 The README and all user-facing output in `reolink-downloader.py` are in **German**; `timelapse.py` output/comments are in English. The newer scripts use German output/help. Keep each file's existing language when editing.
 
@@ -52,12 +52,13 @@ Running the downloader requires reachable cameras listed in `config.json` and a 
 - Videos served via `send_from_directory` (Range/206 + traversal protection); camera folders derived from `config.json`.
 - Manual corrections (class, false positive, vehicle, plate) and static false-positive rules live in `<det-dir>/labels.db` (SQLite, stdlib); they are overlaid on the JSONL data in `apply_labels` (keyed by `track_key` = `<camera|plates>/<clip>/<cls>/<track>`). Detection outputs stay append-only JSONL. Writes are JSON-only POSTs (blocks form CSRF); `/api/events` is gzip-compressed.
 - UI drilldown position is the hash key `at` (`all` | `YYYY` | `YYYY-MM` | `YYYY-MM-DD` | `YYYY-MM-DDTHH`; empty = today).
-- `watchlist.json` (gitignored) maps plates to labels. Non-localhost `--host` enables a random access token.
+- `watchlist.json` (gitignored) maps plates to labels. Non-localhost `--host` enables an access token, persisted in keyring (`reolink-downloader` / `viewer-token`, renew with `--new-token`).
 
 ### Detection pipeline
 - Folder layout: sub stream in `<output_dir>/<name>_sub_<host>/`, main in `<name>_<host>/` (same as the downloader); results in `<output_dir>/detections/<camera>/` (stage 1) and `detections/plates/` (stage 2). All resumable via `done.txt`.
 - Cameras serve only **one download at a time** (HTTP 503 otherwise) at ~0.8 MB/s; different cameras can run in parallel. `fetch_clips.py` writes `.part` files and skips clips still being recorded.
 - `fetch_clips.py` lists all days first, then downloads; progress goes to `<output_dir>/status/<camera>_<stream>.json` (atomic replace, heartbeat every ~2 s). `viewer.py` `/api/status` adds per-day detection counts from `done.txt` and marks jobs "steht" when the heartbeat is older than 90 s.
 - Main and sub filenames for the same clip differ by ~2 s → always match by time with ±10 s tolerance.
+- `detect.py --classes` takes groups `person`, `bike` (bicycle+motorcycle), `vehicle` (car/bus/truck); the viewer maps classes to a `kind` via `REVIEW_CLASSES` (bike is its own kind, no plates). Output format v2 (`"v": 2`): tracks keyed by (ByteTrack id, class) because ByteTrack associates class-agnostically (a v1 track's `cls` was just its first frame's class); per-track `traj`, fragments merged (`merged`), and a verification stage (`verify`) re-checks all two-wheelers and persons with conf < 0.6 using `yolo11m.pt` on an enlarged crop (thresholds calibrated by visual review, see constants in `detect.py`). Clips processed in v2 are listed in `done_v2.txt`; the viewer ignores v1 lines of those clips and maps label keys via `key_alias`. `--redo-persons` re-runs done clips with persons in v2. The viewer marks tracks `weak` (failed verification, low/short confidence, unverified v1 two-wheelers) and hides them except in the "Fehlalarme" review filter.
 - `detect.py --watch SEK` keeps processing newly downloaded clips. Pass folders, not globbed file lists (Windows command-line limit).
 - Night: IR overexposes plates, so plate reads are mostly daylight/colour-mode only.

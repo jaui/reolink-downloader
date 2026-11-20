@@ -35,20 +35,33 @@ from timelapse import FILENAME_RE, parse_video_start
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 WATCHLIST_FILE = SCRIPT_DIR / "watchlist.json"
+KEYRING_SERVICE = "reolink-downloader"
+KEYRING_TOKEN_USER = "viewer-token"
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-VEHICLE_CLASSES = {"car", "bus", "truck"}
 MOVING_MIN_PATH = 0.05      # normierte Verschiebung des Box-Mittelpunkts
 NEAR_MIN_AREA = 0.02        # Box-Anteil am Bild für "nahe" Fahrzeuge
 MATCH_TOLERANCE_S = 10      # Main- und Sub-Dateinamen weichen ca. 2 s ab
 RULE_IOU = 0.5              # Fehlalarm-Regel: Mindestüberlappung der Box mit der Regel-Box
+WEAK_CONF = 0.4             # Spur-Konfidenz darunter = unsicher (wenn nicht nachgeprüft)
+WEAK_SHORT = (3, 0.6)       # weniger Bilder und Spur-Konfidenz darunter = unsicher
 
-# Klassen für die Nachklassifikation -> Art (person/vehicle/other/fp)
+# Erkannte bzw. korrigierte Klasse -> Art (person/bike/vehicle/other/fp)
 REVIEW_CLASSES = {
-    "person": "person", "bicycle": "person",
-    "car": "vehicle", "truck": "vehicle", "bus": "vehicle", "motorcycle": "vehicle",
+    "person": "person", "bicycle": "bike", "motorcycle": "bike",
+    "car": "vehicle", "truck": "vehicle", "bus": "vehicle",
     "animal": "other", "fp": "fp",
 }
+
+
+def kind_of(cls: str) -> str:
+    return REVIEW_CLASSES.get(cls, "other")
+
+
+def is_near(kind: str, area: float) -> bool:
+    """Nur Autos/LKW brauchen eine Mindestgröße; Personen und Zweiräder zählen immer als nah."""
+    return kind != "vehicle" or area >= NEAR_MIN_AREA
+
 
 app = Flask(__name__)
 CFG: dict = {}              # wird in main() gesetzt
@@ -129,6 +142,10 @@ def video_url(camera: str, date: str, name: str) -> str | None:
     return None
 
 
+def read_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").split() if path.exists() else []
+
+
 def iter_jsonl(path: Path):
     if not path.exists():
         return
@@ -184,9 +201,27 @@ def track_key(prefix: str, tr: dict) -> str:
     return f"{prefix}/{Path(tr.get('video', '')).stem}/{tr.get('cls', '?')}/{tr.get('track', 0)}"
 
 
+def weak_reason(tr: dict) -> str | None:
+    """Warum eine Spur unsicher ist (wird im Viewer ausgeblendet), sonst None."""
+    v = tr.get("verify")
+    if v:
+        return None if v.get("ok") else f"Prüfung ({v.get('model')}) nicht bestätigt, Konf. {v.get('conf')}"
+    cls = tr.get("cls")
+    if cls in ("bicycle", "motorcycle"):
+        return "Zweirad nicht nachgeprüft (alte Erkennung)"
+    if "reads" in tr:          # Kennzeichen-Spur aus dem Main-Stream
+        return None
+    conf = tr.get("conf_track", tr.get("max_conf") or 0)
+    if conf < WEAK_CONF:
+        return f"schwache Erkennung, Konf. {conf}"
+    if tr.get("n", 99) < WEAK_SHORT[0] and conf < WEAK_SHORT[1]:
+        return f"nur {tr.get('n')} Bilder, Konf. {conf}"
+    return None
+
+
 def track_entry(camera: str, tr: dict, key: str) -> dict:
     cls = tr.get("cls", "?")
-    kind = "person" if cls == "person" else "vehicle" if cls in VEHICLE_CLASSES else "other"
+    kind = kind_of(cls)
     area = tr.get("max_area", 0)
     path = tr.get("path", 0)
     return {
@@ -200,12 +235,15 @@ def track_entry(camera: str, tr: dict, key: str) -> dict:
         "area": round(area, 4),
         "path": round(path, 3),
         "moving": path >= MOVING_MIN_PATH,
-        "near": kind == "person" or area >= NEAR_MIN_AREA,
+        "near": is_near(kind, area),
         "conf": tr.get("max_conf"),
         "night": bool(tr.get("ir")),
         "box": tr.get("box"),
         "crop": f"/crops/{camera}/{tr['crop']}" if tr.get("crop") else None,
         "plate": None,
+        "weak": weak_reason(tr),
+        "verify": tr.get("verify"),
+        "merged": tr.get("merged"),
     }
 
 
@@ -214,11 +252,17 @@ def build_events() -> dict:
     watchlist = load_watchlist()
     events: dict[str, dict] = {}
 
-    # Stufe 1: Sub-Stream-Erkennung je Kamera
+    # Stufe 1: Sub-Stream-Erkennung je Kamera. Clips in done_v2.txt wurden neu ausgewertet:
+    # ältere Zeilen dieser Clips ignorieren, ihre Schlüssel für Korrekturen umbiegen (key_alias).
+    superseded: dict[str, list] = defaultdict(list)
     for cam_dir in sorted(p for p in det_dir.iterdir() if p.is_dir() and p.name != "plates"):
         camera = cam_dir.name
+        v2 = set(read_lines(cam_dir / "done_v2.txt"))
         for tr in iter_jsonl(cam_dir / "events.jsonl"):
             rel = tr.get("video", "")
+            if rel in v2 and tr.get("v", 1) < 2:
+                superseded[f"{camera}/{Path(rel).stem}"].append(tr)
+                continue
             start = parse_video_start(Path(rel))
             if start is None:
                 continue
@@ -233,6 +277,18 @@ def build_events() -> dict:
                     "tracks": [],
                 }
             ev["tracks"].append(track_entry(camera, tr, track_key(camera, tr)))
+
+    key_alias = {}
+    for eid, old in superseded.items():
+        new = events.get(eid, {}).get("tracks", [])
+        camera = eid.split("/", 1)[0]
+        for tr in old:
+            same = [t for t in new if t["orig_cls"] == tr.get("cls")]
+            if same:
+                a0, a1 = tr.get("t_first", 0), tr.get("t_last", 0)
+                best = max(same, key=lambda t: (min(a1, t["t_last"]) - max(a0, t["t_first"]),
+                                                -abs(t["t_first"] - a0)))
+                key_alias[track_key(camera, tr)] = best["key"]
 
     # Kennzeichen (Main-Stream) zuordnen; ohne passenden Sub-Clip eigenes Ereignis
     plates_cam = CFG["plates_camera"]
@@ -304,6 +360,7 @@ def build_events() -> dict:
         "watchlist": [{"plate": w["plate"], "label": w["label"]} for w in watchlist],
         "rule_iou": RULE_IOU,
         "events": out,
+        "key_alias": key_alias,
     }
 
 
@@ -380,14 +437,16 @@ def labeled_track(camera: str, t: dict, labels: dict, rules: list, watchlist: li
     if not lab and not rule:
         return None
     t = dict(t)
+    if lab and lab["cls"]:
+        t["weak"] = None        # von Hand eingeordnet -> nicht mehr unsicher
     if rule:
         t.update(cls="fp", kind="fp")
         t["review"] = {"by": "rule", "rule": rule["id"]}
     if lab:
         if lab["cls"]:
             t["cls"] = lab["cls"]
-            t["kind"] = REVIEW_CLASSES.get(lab["cls"], "other")
-            t["near"] = t["kind"] == "person" or t["area"] >= NEAR_MIN_AREA
+            t["kind"] = kind_of(lab["cls"])
+            t["near"] = is_near(t["kind"], t["area"])
         t["review"] = {"by": "manual", "cls": lab["cls"], "vehicle": lab["vehicle"],
                        "plate": lab["plate"], "note": lab["note"], "updated": lab["updated"],
                        **({"rule": rule["id"]} if rule else {})}
@@ -409,13 +468,18 @@ def labeled_track(camera: str, t: dict, labels: dict, rules: list, watchlist: li
 
 def apply_labels(base: dict, labels: dict, rules: list) -> dict:
     watchlist = load_watchlist()
+    # Korrekturen an inzwischen neu ausgewerteten Spuren auf die neue Spur übertragen
+    for old, new in base.get("key_alias", {}).items():
+        if old in labels and new not in labels:
+            labels[new] = labels[old]
     events = []
     for ev in base["events"]:
         new = [labeled_track(ev["camera"], t, labels, rules, watchlist) for t in ev["tracks"]]
         if any(new):
             ev = dict(ev, tracks=[n or t for n, t in zip(new, ev["tracks"])])
         events.append(ev)
-    return dict(base, events=events, rules=[{**r, "box": [r["x0"], r["y0"], r["x1"], r["y1"]]} for r in rules])
+    out = {k: v for k, v in base.items() if k != "key_alias"}
+    return dict(out, events=events, rules=[{**r, "box": [r["x0"], r["y0"], r["x1"], r["y1"]]} for r in rules])
 
 
 _cache = {"key": None, "base": None, "lv": None, "data": None, "index": {}}
@@ -425,7 +489,7 @@ _cache_lock = threading.Lock()
 def cache_key() -> tuple:
     det_dir: Path = CFG["det_dir"]
     files = [WATCHLIST_FILE, det_dir / "plates" / "tracks.jsonl"]
-    files += [p / "events.jsonl" for p in det_dir.iterdir() if p.is_dir()]
+    files += [p / name for p in det_dir.iterdir() if p.is_dir() for name in ("events.jsonl", "done_v2.txt")]
     # Videos tauchen nach und nach auf -> grob mit einbeziehen (Minutentakt)
     return tuple((str(f), f.stat().st_mtime_ns if f.exists() else 0) for f in files) + (
         int(datetime.now().timestamp() // 60),)
@@ -464,7 +528,8 @@ def check_token():
     token = CFG.get("token")
     if not token:
         return None
-    if request.args.get("token") == token or request.cookies.get("viewer_token") == token:
+    given = request.args.get("token") or request.cookies.get("viewer_token") or ""
+    if secrets.compare_digest(given.encode(), token.encode()):
         return None
     abort(403)
 
@@ -670,6 +735,16 @@ def video(camera, stream, date, filename):
 
 # ---------------------------------------------------------------------------
 
+def viewer_token(renew: bool) -> str:
+    """Zugangs-Token für den LAN-Betrieb; bleibt über Neustarts gleich (Windows-Anmeldeinformationsverwaltung)."""
+    import keyring
+    token = None if renew else keyring.get_password(KEYRING_SERVICE, KEYRING_TOKEN_USER)
+    if not token:
+        token = secrets.token_urlsafe(16)
+        keyring.set_password(KEYRING_SERVICE, KEYRING_TOKEN_USER, token)
+    return token
+
+
 def lan_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -684,6 +759,8 @@ def main():
     parser.add_argument("--port", type=int, default=8765, help="Port (Standard: 8765)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Adresse (Standard: 127.0.0.1; 0.0.0.0 für Zugriff im LAN, dann mit Token)")
+    parser.add_argument("--new-token", action="store_true",
+                        help="neues Zugangs-Token erzeugen (alte Links und Cookies werden ungültig)")
     parser.add_argument("--det-dir", type=Path, default=None,
                         help="Ordner mit den Erkennungsdaten (Standard: <output_dir>/detections)")
     parser.add_argument("--plates-camera", default="garage2",
@@ -703,7 +780,7 @@ def main():
                db_path=det_dir / "labels.db")
     local = args.host in ("127.0.0.1", "localhost", "::1")
     if not local:
-        CFG["token"] = secrets.token_urlsafe(16)
+        CFG["token"] = viewer_token(args.new_token)
 
     init_db()
     data = get_events()
@@ -714,7 +791,8 @@ def main():
         print(f"Viewer: http://{args.host}:{args.port}/")
     else:
         print("ACHTUNG: Viewer ist im Netzwerk erreichbar, Zugriff nur mit Token.")
-        print(f"Viewer: http://{lan_ip()}:{args.port}/?token={CFG['token']}")
+        for host in (socket.gethostname().lower(), lan_ip()):
+            print(f"Viewer: http://{host}:{args.port}/?token={CFG['token']}")
     print("Beenden mit Ctrl+C.")
     app.run(host=args.host, port=args.port, threaded=True, debug=False)
 

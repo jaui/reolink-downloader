@@ -216,11 +216,11 @@ python timelapse.py --input-dir c:\video.in --date 2026-02-15 --width 960 --heig
 
 ---
 
-# Erkennungs-Pipeline (Personen, Fahrzeuge, Kennzeichen)
+# Erkennungs-Pipeline (Personen, Fahrräder, Fahrzeuge, Kennzeichen)
 
 Zweistufig, damit nicht alle 12-MP-Clips geladen werden müssen:
 
-1. **Sub-Stream laden** (klein, ~1/5 der Größe) und **Personen/Fahrzeuge erkennen** (`detect.py`).
+1. **Sub-Stream laden** (klein, ~1/5 der Größe) und **Personen/Fahrräder/Fahrzeuge erkennen** (`detect.py`).
 2. Nur Clips mit **nahen, fahrenden Fahrzeugen** im **Main-Stream** nachladen und **Kennzeichen lesen** (`plates_scan.py`).
 3. Ergebnisse im **Ereignis-Viewer** ansehen (`viewer.py`, siehe unten).
 
@@ -242,9 +242,12 @@ Modelle liegen in `c:\localapps\alpr\models` (`yolo11n.pt`, fast-alpr-Modelle we
 # 1. Sub-Stream laden (je Kamera nur ein Download gleichzeitig; Kameras parallel möglich)
 python fetch_clips.py --camera garage2 --stream sub --from 2026-10-22 --to 2026-11-18
 
-# 2. Stufe 1: Personen + Fahrzeuge (dauerhaft, alle 10 min neue Clips)
+# 2. Stufe 1: Personen, Zweiräder (+ Fahrzeuge bei garage2), dauerhaft alle 10 min neue Clips
 c:\localapps\alpr\venv\Scripts\python detect.py --camera garage2 --classes all --watch 600
-c:\localapps\alpr\venv\Scripts\python detect.py --camera schuppen2 --classes person
+c:\localapps\alpr\venv\Scripts\python detect.py --camera schuppen2 --classes person,bike --watch 600
+
+# Clips mit Personen im aktuellen Format neu auswerten (z. B. nach Änderungen an der Erkennung)
+c:\localapps\alpr\venv\Scripts\python detect.py --camera garage2 --classes all --redo-persons
 
 # 3. Main-Stream nur für Clips mit nahen, fahrenden Fahrzeugen nachladen
 python fetch_clips.py --camera garage2 --stream main --from 2026-10-22 --to 2026-11-18 ^
@@ -260,7 +263,7 @@ python camsettings.py --camera garage2
 | Skript | wichtige Optionen |
 |---|---|
 | `fetch_clips.py` | `--camera`, `--stream main\|sub`, `--from`, `--to`, `--only <liste.txt>`, `--from-events <events.jsonl>`, `--min-area` (0.02), `--min-path` (0.05) |
-| `detect.py` | `--camera` oder Ordner/Dateien + `--out`, `--classes person\|vehicle\|all`, `--fps` (2), `--from`, `--to`, `--watch SEK` |
+| `detect.py` | `--camera` oder Ordner/Dateien + `--out`, `--classes` (Komma-Liste aus `person`, `bike` = Fahrrad/Motorrad, `vehicle` = Auto/Bus/LKW, oder `all`), `--redo-persons` (bearbeitete Clips mit Personen neu auswerten, Fortschritt in `done_v2.txt`), `--fps` (2), `--from`, `--to`, `--watch SEK` |
 | `plates_scan.py` | `--camera` oder Ordner/Dateien + `--out`, `--from`, `--to`, `--fps` (2), `--min-plate-area` (0.008), `--keep-area` (0.02) |
 
 Alle Schritte sind fortsetzbar (`done.txt` bzw. vorhandene Dateien werden übersprungen).
@@ -271,12 +274,13 @@ Alle Schritte sind fortsetzbar (`done.txt` bzw. vorhandene Dateien werden übers
 
 # Ereignis-Viewer (`viewer.py`)
 
-Kleine Web-App (Flask) zum Durchsehen der erkannten **Personen** und **Fahrzeuge** inkl. Kennzeichen-Lesungen. Läuft lokal; Bilder und Videos verlassen den Rechner nicht.
+Kleine Web-App (Flask) zum Durchsehen der erkannten **Personen**, **Räder** und **Fahrzeuge** inkl. Kennzeichen-Lesungen. Läuft lokal; Bilder und Videos verlassen den Rechner nicht.
 
-- Filter: Kamera, Personen/Fahrzeuge, Tag/Nacht, Zeitraum, „Fahrzeuge nur nah & bewegt" (blendet geparkte Autos und entfernten Verkehr aus), Suche nach Kennzeichen oder Fahrzeugname
+- Filter: Kamera, Personen/Räder/Fahrzeuge, Tag/Nacht, Zeitraum, „nur nah & bewegt" (blendet geparkte Autos, entfernten Verkehr und abgestellte Räder aus), Suche nach Kennzeichen oder Fahrzeugname
 - Drilldown: Jahre → Monate → Tage → Stunden → Detail mit Video, Bildausschnitten, Kennzeichen; Start ist der aktuelle Tag. Jede Zeile hat einen Zeitstreifen (Monate/Tage/Stunden), ein Klick auf ein Fach springt direkt dorthin
 - Personenzahl auf den Karten: `2` = zwei Spuren, gleichzeitig im Bild; `1–3` = höchstens eine gleichzeitig, aber drei Spuren (eine Person bekommt nach Verdeckung oft eine neue Spur)
-- Nachklassifikation im Detail: Klasse korrigieren (Person, Fahrrad, Auto, LKW/Transporter, Bus, Motorrad, Tier, Fehlalarm), bestätigen, Fahrzeug aus der Watchlist zuordnen oder Kennzeichen von Hand eintragen (danach per Suche auffindbar). Tasten: `B` bestätigen, `F` Fehlalarm, `P` Person, `A` Auto, `L` LKW, `T` Tier. Für stehende Fehlalarme (z. B. Gartenstuhl als „Person“) gibt es eine Regel „alle stehenden Erkennungen dieser Klasse an dieser Stelle“. Filter „Prüfung“: Alle / Offen / Geprüft / Fehlalarme
+- Nachklassifikation im Detail: Klasse korrigieren (Person, Fahrrad, Auto, LKW/Transporter, Bus, Motorrad, Tier, Fehlalarm), bestätigen, Fahrzeug aus der Watchlist zuordnen oder Kennzeichen von Hand eintragen (danach per Suche auffindbar). Tasten: `B` bestätigen, `F` Fehlalarm, `P` Person, `R` Fahrrad, `A` Auto, `L` LKW, `T` Tier. Für stehende Fehlalarme (z. B. Gartenstuhl als „Person“) gibt es eine Regel „alle stehenden Erkennungen dieser Klasse an dieser Stelle“. Filter „Prüfung“: Alle / Offen / Geprüft / Fehlalarme
+- Unsichere Erkennungen (Prüfstufe mit YOLO11m nicht bestätigt, sehr schwache oder sehr kurze Spuren) sind ausgeblendet und unter „Fehlalarme“ mit Badge „unsicher“ zu sehen; nachgeprüfte Spuren tragen „geprüft“
 - Korrekturen liegen in `downloads/detections/labels.db` (SQLite); die Erkennungsdateien bleiben unverändert
 - Responsiv (Handy: Detail als Vollbild), Zustand im URL-Hash (Zurück-Taste, Lesezeichen), Aktualisierung alle 60 s
 - Download-Fortschritt: Karte je laufendem `fetch_clips.py` (geladen/erkannt, MB/s, Restzeit, aktueller Clip, Erkennung aktiv?) und je Tag in der Tagesübersicht; Tage ohne Ereignisse erscheinen ebenfalls (Zeitverlauf lückenlos)
@@ -294,7 +298,8 @@ python viewer.py --host 0.0.0.0       # im LAN erreichbar (z. B. Handy), Zugriff
 | Option | Bedeutung |
 |---|---|
 | `--port` | Port (Standard 8765) |
-| `--host` | Adresse (Standard 127.0.0.1; bei anderer Adresse wird ein Zufallstoken erzeugt) |
+| `--host` | Adresse (Standard 127.0.0.1; bei anderer Adresse ist ein Token nötig. Es wird einmal erzeugt, in der Windows-Anmeldeinformationsverwaltung gespeichert und bleibt über Neustarts gleich; der Link steht in der Startausgabe, z. B. `http://keller:8765/?token=…`, danach merkt sich der Browser es 30 Tage per Cookie) |
+| `--new-token` | neues Token erzeugen (alte Links/Cookies werden ungültig) |
 | `--det-dir` | Ordner mit den Erkennungsdaten (Standard `<output_dir>/detections`) |
 | `--plates-camera` | Kamera, zu der `plates/tracks.jsonl` gehört (Standard `garage2`) |
 
